@@ -92,9 +92,24 @@ pi --rlm -e ./src/extension/index.ts
 | `PI_RLM_SUBAGENT_MODEL` | `anthropic/haiku` | Model children are spawned with |
 | `PI_RLM_MAX_DEPTH` | `2` | How deep recursive delegation may go |
 | `PI_RLM_DEPTH` | `0` | Depth of the current agent; set on children automatically |
+| `PI_RLM_NPM_CACHE_DIR` | `~/.cache/pi-rlm-npm` | Cache for lazy `npm:` imports |
 
 Session state lives in `.pi-rlm/<session>/`: the namespace snapshot and each
 subagent's session file and output.
+
+### npm imports
+
+Static top-level imports can use npm-style specifiers. Packages install lazily into
+the cache and load through Bun:
+
+```ts
+import { z } from "npm:zod@4";
+import express from "npm:express@5";
+```
+
+Pin versions when repeatability matters. This feature installs and executes npm
+packages, so treat specifiers as code-execution input. Dynamic `import("npm:...")`
+is not supported yet.
 
 ## How it works
 

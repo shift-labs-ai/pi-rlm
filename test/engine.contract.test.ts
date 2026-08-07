@@ -65,6 +65,19 @@ describe("persistence", () => {
 		expect(r.status).toBe("ok");
 		expect(r.result).toContain("a/b");
 	});
+
+	test("versioned npm imports install lazily and persist across cells", async () => {
+		const m = engine({ env: { PI_RLM_NPM_CACHE_DIR: tempDir() } });
+		const first = await m.execute(
+			'import { parse } from "npm:acorn@8.18.0"; parse("let x = 1", { ecmaVersion: "latest" }).body[0].type;',
+		);
+		expect(first.status).toBe("ok");
+		expect(first.result).toContain("VariableDeclaration");
+
+		const second = await m.execute('parse("const y = 2", { ecmaVersion: "latest" }).body[0].type;');
+		expect(second.status).toBe("ok");
+		expect(second.result).toContain("VariableDeclaration");
+	});
 });
 
 // ── 2. Top-level await ────────────────────────────────────────────────────────

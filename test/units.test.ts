@@ -85,6 +85,13 @@ describe("transform: imports", () => {
 		expect(declaredNames).toEqual([]);
 	});
 
+	test("npm imports use the guest cache importer", () => {
+		const { body, declaredNames } = transformCell('import { z } from "npm:zod@4";', { ctxName: "ctx" });
+		expect(body).toContain('await ctx.importModule("npm:zod@4")');
+		expect(body).not.toContain('await import("npm:zod@4")');
+		expect(declaredNames).toEqual(["z"]);
+	});
+
 	test("export statements are rejected with a clear SyntaxError", () => {
 		expect(() => transformCell("export const nope = 1;")).toThrow(/export/i);
 		expect(() => transformCell("export default 1;")).toThrow(/export/i);

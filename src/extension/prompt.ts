@@ -90,6 +90,7 @@ export function buildRlmTsPrompt(options: RlmPromptOptions): string {
 		`Recursive agent depth: ${depth}`,
 		`Current date: ${date}`,
 		"The evaluator is Bun (TypeScript). The full Bun and Node standard libraries are available; install additional packages with `await Bun.$`bun add <pkg>`.quiet()` only when genuinely needed.",
+		'Static top-level imports may use versioned npm specifiers, for example `import { z } from "npm:zod@4"`; packages install lazily into the pi-rlm npm cache. Dynamic `import("npm:...")` is not supported yet.',
 	];
 
 	const childDoctrine = buildChildDoctrine(options);

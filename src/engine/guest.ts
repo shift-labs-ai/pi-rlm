@@ -21,6 +21,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { writeSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { format } from "node:util";
+import { importNpm } from "./npm.js";
 import {
 	decodeMessage,
 	encodeMessage,
@@ -92,6 +93,7 @@ interface CellContext {
 	aborted: boolean;
 	result?: { value: unknown };
 	setResult(value: unknown): void;
+	importModule(specifier: string): Promise<unknown>;
 }
 
 const cellStorage = new AsyncLocalStorage<CellContext>();
@@ -103,6 +105,9 @@ function makeCellContext(cellId: string): CellContext {
 		aborted: false,
 		setResult(value: unknown) {
 			if (!ctx.aborted) ctx.result = { value };
+		},
+		importModule(specifier: string) {
+			return importNpm(specifier);
 		},
 	};
 	return ctx;
