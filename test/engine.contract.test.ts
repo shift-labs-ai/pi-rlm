@@ -11,7 +11,7 @@
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EngineBusyError, EngineManager } from "../src/engine/index.js";
@@ -35,6 +35,22 @@ afterEach(async () => {
 	await Promise.allSettled(managers.splice(0).map((m) => m.kill()));
 	for (const d of tempDirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
+
+/**
+ * Wait for the observable outcome rather than for a duration.
+ *
+ * A fixed sleep long enough to be reliable on an idle machine is not long
+ * enough when the whole suite is running, and a sleep long enough for that is
+ * dead time in every other run.
+ */
+async function waitFor(condition: () => boolean, timeoutMs = 10_000): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (condition()) return true;
+		await new Promise((r) => setTimeout(r, 25));
+	}
+	return condition();
+}
 
 // ── 1. Persistence ────────────────────────────────────────────────────────────
 // The premise of the whole design: an agent can build state across calls
@@ -731,7 +747,9 @@ describe("snapshot/restore", () => {
 		const snapshot = { path: join(d, "ns.snapshot"), debounceMs: 100 };
 		const m1 = engine({ snapshot });
 		await m1.execute("let autoSaved = 314;");
-		await new Promise((r) => setTimeout(r, 500)); // let the debounced snapshot fire
+		// The debounce fires on its own; wait for the file it produces, not for a
+		// duration that happens to be long enough on an unloaded machine.
+		expect(await waitFor(() => existsSync(snapshot.path))).toBe(true);
 		await m1.kill();
 
 		const m2 = engine({ snapshot });
