@@ -74,8 +74,15 @@ export interface ExecuteOptions {
 
 /** Passed alongside a host request's payload. */
 export interface HostRequestContext {
-	/** Aborts when the cell that (transitively) issued the request is cancelled. */
-	signal?: AbortSignal;
+	/**
+	 * Aborts when the cell that issued this request is cancelled, or when that
+	 * cell settles for any other reason — work outliving its cell is orphaned.
+	 *
+	 * Always present. A request whose cell is too old to still be tracked
+	 * arrives already aborted rather than without a signal, so a handler never
+	 * has to decide what an absent signal means.
+	 */
+	signal: AbortSignal;
 }
 
 /** Handles one typed request from guest code. Reply is sent back verbatim. */
@@ -192,7 +199,6 @@ export class EngineManager {
 	/** Held so the protocol reader is not garbage-collected mid-session, which
 	 * would close the guest's write end and kill it with EPIPE. */
 	private protocolReader?: ReturnType<typeof createInterface>;
-	private lastCellCode?: string;
 	/** Abort + source per cell, retained past settlement for late bridge calls. */
 	private readonly cellRecords = new Map<string, { hostAbort: AbortController; code: string }>();
 	/** Set when an aborted cell may still be wedging the guest's event loop. */
@@ -478,10 +484,12 @@ export class EngineManager {
 			// already cancelled, which nothing can then cancel.
 			const record = this.cellRecords.get(cellId);
 			// A cell we no longer have a record for is old enough to be an orphan.
-			// Refusing to grant an open-ended signal is the safe reading.
+			// Refusing to grant an open-ended signal is the safe reading, and the
+			// source is reported as unknown rather than guessed: naming the most
+			// recent cell instead would be the same misattribution this exists to
+			// prevent, only harder to notice because it looks like an answer.
 			const signal = record ? record.hostAbort.signal : AbortSignal.abort();
-			const cellSourceCode = record?.code ?? this.lastCellCode;
-			const reply = await handler({ ...payload, cellSourceCode }, { signal });
+			const reply = await handler({ ...payload, cellSourceCode: record?.code }, { signal });
 			this.sendToGuest({ type: "host_reply", id, status: "ok", payload: reply });
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
@@ -573,7 +581,6 @@ export class EngineManager {
 	private executeInner(code: string, opts: ExecuteOptions): Promise<ExecuteResult> {
 		const cellId = randomUUID();
 		const started = Date.now();
-		this.lastCellCode = code;
 
 		return new Promise<ExecuteResult>((resolve, reject) => {
 			const active: ActiveExecution = {
