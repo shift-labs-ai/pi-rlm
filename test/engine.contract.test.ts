@@ -530,6 +530,118 @@ describe("host bridge", () => {
 		expect(String(attributed)).toContain("veryUniqueMarker123");
 	});
 
+	test("aborting a cell parked on a host handler frees the engine for the next cell", async () => {
+		// The bridge deliberately has no timeout: a bridged tool may legitimately
+		// run for minutes. Cancellation is therefore the only escape from a handler
+		// that never settles, and it must return the evaluator to service — the
+		// queue is serialized, so a cell that never releases its slot would take
+		// every later cell with it.
+		const m = engine({
+			hostHandlers: {
+				"test.never": () => new Promise<Record<string, unknown>>(() => {}),
+			},
+		});
+		await m.execute("let before = 5;");
+		const ac = new AbortController();
+		const parked = m.execute('await rlm.hostRequest("test.never", {}); "never-reached"', { signal: ac.signal });
+		await new Promise((r) => setTimeout(r, 300));
+		ac.abort();
+		expect((await parked).status).toBe("aborted");
+		// The queue must be free: a later cell runs, and the namespace is intact.
+		const next = await Promise.race([
+			m.execute("before + 1"),
+			new Promise<never>((_, reject) => setTimeout(() => reject(new Error("engine wedged")), 8_000)),
+		]);
+		expect(next.result).toContain("6");
+	}, 20_000);
+
+	test("aborting a cell unwinds it inside the guest instead of parking it forever", async () => {
+		// Freeing the host's queue is not enough. If nothing rejects the guest's
+		// side of the request, the cell stays suspended inside the evaluator for the
+		// life of the process, holding its continuation and its pending entry. Those
+		// accumulate silently across a long session.
+		//
+		// Observed through a second bridge call from the catch block, because an
+		// aborted cell can neither write to the namespace nor stream output.
+		let unwound = false;
+		const m = engine({
+			hostHandlers: {
+				"test.deaf": () => new Promise<Record<string, unknown>>(() => {}),
+				"test.unwound": async () => {
+					unwound = true;
+					return {};
+				},
+			},
+		});
+		const ac = new AbortController();
+		const parked = m.execute(
+			'try { await rlm.hostRequest("test.deaf", {}); } catch { await rlm.hostRequest("test.unwound", {}); }',
+			{ signal: ac.signal },
+		);
+		await new Promise((r) => setTimeout(r, 300));
+		ac.abort();
+		expect((await parked).status).toBe("aborted");
+		await new Promise((r) => setTimeout(r, 500));
+		expect(unwound).toBe(true);
+		// And the evaluator is still healthy afterwards.
+		expect((await m.execute("1 + 1")).result).toContain("2");
+	}, 20_000);
+
+	test("a request from an orphaned continuation gets an already-aborted signal, never undefined", async () => {
+		// The host force-settles a cancelled cell after a short grace period and
+		// clears activeExecution. The guest's continuation can outlive that and
+		// still call the bridge. Resolving the signal from whatever happens to be
+		// active hands that request `undefined` — host work spawned by a cell the
+		// agent already cancelled, which nothing can then cancel.
+		const seen: { hadSignal: boolean; aborted: boolean; source: string }[] = [];
+		const m = engine({
+			hostHandlers: {
+				"test.late": async (payload, context) => {
+					seen.push({
+						hadSignal: Boolean(context?.signal),
+						aborted: context?.signal?.aborted ?? false,
+						source: String(payload.cellSourceCode ?? ""),
+					});
+					return {};
+				},
+			},
+		});
+		const ac = new AbortController();
+		const marker = "const orphanMarker456 = 1;";
+		const pending = m.execute(
+			`${marker}\ntry { await new Promise((r) => setTimeout(r, 1500)); } finally { await rlm.hostRequest("test.late", {}); }`,
+			{ signal: ac.signal },
+		);
+		await new Promise((r) => setTimeout(r, 200));
+		ac.abort();
+		expect((await pending).status).toBe("aborted");
+		// Let the orphan's finally-block fire well after the force-settle.
+		await new Promise((r) => setTimeout(r, 2_000));
+		expect(seen.length).toBeGreaterThan(0);
+		expect(seen[0]!.hadSignal).toBe(true);
+		expect(seen[0]!.aborted).toBe(true);
+		// Attribution follows the issuing cell, not whatever ran most recently.
+		expect(seen[0]!.source).toContain("orphanMarker456");
+	}, 20_000);
+
+	test("cellSourceCode names the issuing cell even while a different cell is active", async () => {
+		// lastCellCode is a fallback, and a fallback that is wrong is worse than no
+		// attribution: the host would record an action against a program that did
+		// not ask for it.
+		const sources: string[] = [];
+		const m = engine({
+			hostHandlers: {
+				"test.who": async (payload) => {
+					sources.push(String(payload.cellSourceCode ?? ""));
+					return {};
+				},
+			},
+		});
+		await m.execute('const issuerMarker789 = 1; await rlm.hostRequest("test.who", {});');
+		expect(sources).toHaveLength(1);
+		expect(sources[0]).toContain("issuerMarker789");
+	});
+
 	test("unknown request type rejects in the guest, naming the type; cell reports error", async () => {
 		const m = engine({ hostHandlers: {} });
 		const r = await m.execute('await rlm.hostRequest("no.such.type", {});');

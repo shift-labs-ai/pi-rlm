@@ -45,7 +45,19 @@ export interface GuestToHost {
 		error?: { name: string; message: string; stack: string[] };
 	};
 	pong: { type: "pong"; id: string };
-	host_request: { type: "host_request"; id: string; requestType: string; payload: Record<string, unknown> };
+	/**
+	 * `cellId` names the cell that issued the request. The host resolves the
+	 * abort signal and source attribution from it rather than from whatever cell
+	 * happens to be active, because a cancelled cell's continuation can still
+	 * reach the bridge after the host has moved on.
+	 */
+	host_request: {
+		type: "host_request";
+		id: string;
+		cellId: string;
+		requestType: string;
+		payload: Record<string, unknown>;
+	};
 	snapshot_result: {
 		type: "snapshot_result";
 		id: string;

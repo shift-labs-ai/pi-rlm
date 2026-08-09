@@ -173,6 +173,8 @@ console.trace = consoleErr;
 // ── host bridge (rlm handle) ─────────────────────────────────────────────────
 
 interface PendingHostRequest {
+	/** The cell that issued this request; cancelling that cell rejects it. */
+	cellId: string;
 	resolve(payload: Record<string, unknown>): void;
 	reject(error: Error): void;
 }
@@ -185,9 +187,10 @@ function hostRequest(requestType: string, payload: Record<string, unknown> = {})
 		return Promise.reject(new TypeError("requestType must be a non-empty string"));
 	}
 	const id = `hr-${++hostRequestCounter}`;
+	const cellId = (cellStorage.getStore() ?? activeCell)?.cellId ?? "";
 	return new Promise((resolve, reject) => {
-		pendingHostRequests.set(id, { resolve, reject });
-		send({ type: "host_request", id, requestType, payload });
+		pendingHostRequests.set(id, { cellId, resolve, reject });
+		send({ type: "host_request", id, cellId, requestType, payload });
 	});
 }
 
@@ -328,6 +331,16 @@ async function runCell(cellId: string, code: string): Promise<void> {
 function abortCell(cellId: string): void {
 	const ctx = liveCells.get(cellId);
 	if (ctx) ctx.aborted = true;
+	// Reject whatever this cell is waiting on at the bridge. The host stops
+	// caring about a cancelled cell after a short grace period, so nothing else
+	// will ever settle these: without this the cell stays suspended inside the
+	// evaluator for the life of the process, holding its continuation and its
+	// pending entry, and those accumulate across a long session.
+	for (const [id, pending] of [...pendingHostRequests]) {
+		if (pending.cellId !== cellId) continue;
+		pendingHostRequests.delete(id);
+		pending.reject(new Error("the cell that issued this host request was cancelled"));
+	}
 }
 
 // ── snapshot / restore / names ───────────────────────────────────────────────
