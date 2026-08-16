@@ -42,6 +42,89 @@ export interface TransformOptions {
 // deadCodeElimination would drop side-effect-free trailing expressions — the
 // exact thing we capture as the cell result.
 const transpiler = new Bun.Transpiler({ loader: "ts", deadCodeElimination: false });
+	// ──── teaching errors for template-literal interpolation ───────────────────────────────────────
+// Bun's compiler reports bash-style ${...} inside a template literal (backticks)
+// as a plain parse failure ("Unexpected }"), with nothing an agent can act on —
+// it retries the same trap. Turn that BuildMessage into a teaching error: name
+// the pattern, point at the position, and include a repair verified to recompile.
+interface BuildMessageLike {
+	name?: string;
+	message?: string;
+	position?: { line?: number; column?: number; lineText?: string };
+}
+
+/** Escape unescaped ${ inside backtick literals; null if nothing changed. */
+function escapeTemplateDollars(src: string): string | null {
+	let out = "";
+	let inTick = false;
+	for (let i = 0; i < src.length; i++) {
+		const ch = src[i];
+		if (inTick && ch === "\\") {
+			out += ch + (src[i + 1] ?? "");
+			i += 1;
+			continue;
+		}
+		if (ch === "`") {
+			inTick = !inTick;
+			out += ch;
+			continue;
+		}
+		if (inTick && ch === "$" && src[i + 1] === "{") {
+			let backslashes = 0;
+			for (let k = i - 1; k >= 0 && src[k] === "\\"; k--) backslashes += 1;
+			// Already escaped (\${...}) — leave it alone.
+			if (backslashes % 2 === 0) {
+				out += "\\${";
+				i += 1;
+				continue;
+			}
+		}
+		out += ch;
+	}
+	return out === src ? null : out;
+}
+
+function teachingMessage(bm: { line?: number; column?: number; lineText: string }, error: unknown, verified: boolean, repaired: string | null): string {
+	const msg = error instanceof Error ? error.message : String(error);
+	const lines = [
+		`Cell did not compile: Bun BuildMessage at line ${bm.line}, column ${bm.column} — "${msg}".`,
+		"Likely cause: bash syntax inside a template literal (backticks). Bun parses ${ ... } as a JavaScript",
+		"interpolation, so bash parameter expansion such as ${VAR}, ${VAR-default} or ${VAR:+alt} is invalid JavaScript.",
+		'Fix: backslash-escape the dollar so the shell receives the literal text: write \\${VAR} inside the backticks,',
+		'e.g. echo "CLAUDECODE=\\${CLAUDECODE-<unset>}" → the shell sees ${CLAUDECODE-<unset>}, Bun sees a plain string.',
+	];
+	if (verified && repaired !== null) {
+		lines.push("The compiler accepts this repair (confirm it matches your intent):");
+		lines.push("  " + repaired.replace(/\n/g, "\n  "));
+	} else {
+		lines.push("Escaping the dollar did not make this cell compile, so treat this instead as a plain syntax");
+		lines.push("error at the position above.");
+	}
+	return lines.join("\n");
+}
+
+function transpileCell(code: string): string {
+	try {
+		return transpiler.transformSync(code);
+	} catch (error) {
+		const bm = error as BuildMessageLike;
+		if (bm.name !== "BuildMessage" || !bm.position?.lineText) throw error;
+		const repaired = escapeTemplateDollars(code);
+		let verified = false;
+		if (repaired !== null) {
+			try {
+				transpiler.transformSync(repaired);
+				verified = true;
+			} catch {
+				// The original failure stands; the repair did not help.
+			}
+		}
+		// Only claim the shell-trap diagnosis when the failing line itself shows
+		// the pattern, or the escape demonstrably fixes the cell.
+		if (!bm.position.lineText.includes("${") && !verified) throw error;
+		throw new SyntaxError(teachingMessage(bm.position, error, verified, repaired));
+	}
+}
 
 function collectPatternNames(pattern: Pattern, into: string[]): void {
 	switch (pattern.type) {
@@ -115,7 +198,7 @@ function variableReplacement(decl: VariableDeclaration, source: string): string 
 
 export function transformCell(code: string, options: TransformOptions = {}): TransformedCell {
 	const ctxName = options.ctxName ?? "__ctx";
-	const js = transpiler.transformSync(code);
+	const js = transpileCell(code);
 	const program: Program = parse(js, { ecmaVersion: "latest", sourceType: "module", allowAwaitOutsideFunction: true });
 
 	const declaredNames: string[] = [];
