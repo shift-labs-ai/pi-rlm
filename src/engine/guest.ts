@@ -282,22 +282,104 @@ function hostRequest(requestType: string, payload: Record<string, unknown> = {})
  * value from one that is genuinely the word "undefined", so it is refused here,
  * before the command is ever built.
  */
+interface SafeShellResult {
+	stdout: string;
+	stderr: string;
+	exitCode: number;
+	status: "ok" | "error";
+}
+
+/**
+ * The guest's stdin (fd 0) is the host's command pipe, which never closes.
+ * Bun.$ inherits this pipe as stdin for every child process it spawns, so
+ * commands that read stdin (cat, head without a pipe, interactive programs)
+ * hang forever waiting for EOF that never arrives.
+ *
+ * Bun.$ in 1.3.x has no .stdin() method and no support for < /dev/null
+ * redirects, so the tagged-template path is rebuilt on Bun.spawn with
+ * stdin: "ignore". Children get an immediate EOF instead of inheriting the
+ * command pipe. bash -c preserves pipes, globbing, and env expansion.
+ *
+ * The Proxy keeps the rest of Bun.$'s surface (Shell, ShellPromise,
+ * ShellError, braces, escape) intact.
+ */
 function guardShellInterpolation(shell: typeof Bun.$): typeof Bun.$ {
+	const runSafe = (
+		strings: TemplateStringsArray,
+		values: unknown[],
+	): Promise<SafeShellResult> & {
+		quiet(): ReturnType<typeof runSafe>;
+		nothrow(): ReturnType<typeof runSafe>;
+		text(): Promise<string>;
+		json(): Promise<unknown>;
+		lines(): Promise<string[]>;
+	} => {
+		for (let i = 0; i < values.length; i++) {
+			if (values[i] === null || values[i] === undefined) {
+				const preceding = (strings?.[i] ?? "").trimStart().slice(-40);
+				const where = preceding ? ` (after "…${preceding}")` : "";
+				throw new TypeError(
+					`Bun.$ interpolation #${i + 1}${where} is ${values[i] === null ? "null" : "undefined"}. ` +
+						`It would be interpolated as the literal text "${String(values[i])}", producing a command that runs ` +
+						"against the wrong target. Check the value before using it in a shell command.",
+				);
+			}
+		}
+
+		let cmd = "";
+		for (let i = 0; i < strings.length; i++) {
+			cmd += strings[i];
+			if (i < values.length) cmd += String(values[i]);
+		}
+
+		let isQuiet = false;
+		let isNothrow = false;
+
+		async function run(): Promise<SafeShellResult> {
+			const proc = Bun.spawn(["bash", "-c", cmd], {
+				stdin: "ignore", // Do not inherit the guest's command pipe (never closes).
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [stdout, stderr] = await Promise.all([
+				new Response(proc.stdout).text(),
+				new Response(proc.stderr).text(),
+			]);
+			const exitCode = await proc.exited;
+
+			if (!isQuiet) {
+				if (stdout) process.stdout.write(stdout);
+				if (stderr) process.stderr.write(stderr);
+			}
+
+			if (exitCode !== 0 && !isNothrow) {
+				const err = new Error(`Command failed with exit code ${exitCode}: ${stderr || stdout}`);
+				(err as Error & { stderr: string; stdout: string }).stderr = stderr;
+				(err as Error & { stdout: string }).stdout = stdout;
+				throw err;
+			}
+
+			return { stdout, stderr, exitCode, status: exitCode === 0 ? "ok" : "error" };
+		}
+
+		const promise = run() as ReturnType<typeof runSafe>;
+		promise.quiet = () => { isQuiet = true; return promise; };
+		promise.nothrow = () => { isNothrow = true; return promise; };
+		promise.text = () => promise.then((r) => r.stdout);
+		promise.json = () => promise.then((r) => JSON.parse(r.stdout));
+		promise.lines = () => promise.then((r) => r.stdout.split("\n").filter(Boolean));
+		return promise;
+	};
+
 	return new Proxy(shell, {
 		apply(target, thisArg, args: unknown[]) {
 			const [strings, ...values] = args as [TemplateStringsArray, ...unknown[]];
-			for (let i = 0; i < values.length; i++) {
-				if (values[i] === null || values[i] === undefined) {
-					const preceding = (strings?.[i] ?? "").trimStart().slice(-40);
-					const where = preceding ? ` (after "…${preceding}")` : "";
-					throw new TypeError(
-						`Bun.$ interpolation #${i + 1}${where} is ${values[i] === null ? "null" : "undefined"}. ` +
-							`It would be interpolated as the literal text "${String(values[i])}", producing a command that runs ` +
-							"against the wrong target. Check the value before using it in a shell command.",
-					);
-				}
-			}
-			return Reflect.apply(target as (...a: unknown[]) => unknown, thisArg, args);
+			return runSafe(strings, values);
+		},
+		// Static surface (Shell, ShellPromise, ShellError, braces, escape)
+		// passes through to the real Bun.$.
+		get(target, key, receiver) {
+			return Reflect.get(target, key, receiver);
 		},
 	});
 }
