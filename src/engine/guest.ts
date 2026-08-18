@@ -10,15 +10,18 @@
  * It also tags output with the cell that produced it, serves snapshot,
  * restore, and listing requests, and forwards host requests made from cells.
  *
- * Protocol traffic leaves on fd 3 and carries a nonce, so cell output can be
- * neither mistaken for nor forged into a protocol message.
+ * Protocol traffic travels on fd 3 — both directions — and carries a nonce, so
+ * cell output can be neither mistaken for nor forged into a protocol message.
+ * stdin is /dev/null: subprocesses spawned by cells inherit this process's
+ * fd 0, and if it were the host's command pipe (which never closes), anything
+ * reading stdin would hang forever waiting for EOF.
  *
  * Runs as: bun guest.ts   (spawned by EngineManager)
  */
 
 import { deserialize, serialize } from "bun:jsc";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { writeSync } from "node:fs";
+import { createReadStream, writeSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { format } from "node:util";
 import { importNpm } from "./npm.js";
@@ -556,7 +559,11 @@ process.on("unhandledRejection", (reason) => reportStrayError("unhandled rejecti
 
 // ── message loop ─────────────────────────────────────────────────────────────
 
-const readline = createInterface({ input: process.stdin });
+// Commands arrive on the same duplex fd the replies leave on. Reading and
+// writing are independent directions of the socketpair, so the sync writes in
+// send() do not interfere with this stream. The empty path is ignored when an
+// fd is supplied; it only satisfies the signature.
+const readline = createInterface({ input: createReadStream("", { fd: PROTOCOL_FD }) });
 
 readline.on("line", (line) => {
 	const message = decodeMessage<HostToGuestMessage>(line, NONCE);
@@ -601,8 +608,10 @@ readline.on("line", (line) => {
 });
 
 readline.on("close", () => {
+	// The host holds the other end of this pipe; EOF here means the host is
+	// gone, even if it died too abruptly to kill this process.
 	try {
-		writeSync(2, "[guest] stdin closed; exiting\n");
+		writeSync(2, "[guest] protocol pipe closed; exiting\n");
 	} catch {}
 	process.exit(0);
 });

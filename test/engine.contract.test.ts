@@ -222,6 +222,29 @@ describe("shell", () => {
 	});
 });
 
+// ── 4b. Child stdin ───────────────────────────────────────────────────────────
+// The host speaks to the guest over a pipe that stays open for the whole
+// session. If child processes inherited that pipe as stdin, anything that
+// reads stdin (`cat`, `read`, an interactive prompt) would wait forever for an
+// EOF that never comes — a hang the agent can neither see nor debug. Children
+// must find stdin already at EOF instead.
+
+describe("child process stdin", () => {
+	test("a Bun.$ child that reads stdin sees immediate EOF instead of hanging", async () => {
+		const m = engine();
+		const r = await m.execute("const out = await Bun.$`cat`.quiet(); `eof:${out.stdout.toString().length}`");
+		expect(r.status).toBe("ok");
+		expect(r.result).toContain("eof:0");
+	}, 8_000);
+
+	test("piped stdin still reaches the child", async () => {
+		const m = engine();
+		const r = await m.execute("(await Bun.$`echo piped-through | cat`.quiet()).stdout.toString().trim()");
+		expect(r.status).toBe("ok");
+		expect(r.result).toContain("piped-through");
+	});
+});
+
 // ── 5. Streaming ──────────────────────────────────────────────────────────────
 // Output must reach the caller while the cell is still running, or a long task
 // looks indistinguishable from a hung one.
