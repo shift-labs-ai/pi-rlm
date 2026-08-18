@@ -158,6 +158,62 @@ describe("transform: syntax edge cases", () => {
 	});
 });
 
+// ── compile errors teach ──────────────────────────────────────────────────────
+// Bun.Transpiler throws BuildMessage objects whose stringified form drops the
+// position entirely — an agent sees `Expected "}" but found ":"` with no line,
+// no column, no source. The transform must rebuild every compile failure into
+// a compiler-style display (message, position, offending line, caret), and add
+// a one-line hint for known traps. The only known trap so far: bash-style
+// ${...} inside a template literal, which Bun parses as JS interpolation, so
+// shell parameter expansion written into Bun.$`...` fails to compile with a
+// message the agent retries against verbatim.
+
+describe("transform: compile errors teach", () => {
+	function compileError(code: string): string {
+		try {
+			transformCell(code);
+		} catch (error) {
+			return (error as Error).message;
+		}
+		throw new Error(`expected a compile error for: ${code}`);
+	}
+
+	test("a compile error names its position and shows the offending line with a caret", () => {
+		const message = compileError("const x = ;");
+		expect(message).toContain("Unexpected ;");
+		expect(message).toContain("line 1, column 11");
+		const lines = message.split("\n");
+		const sourceAt = lines.indexOf("  const x = ;");
+		expect(sourceAt).toBeGreaterThan(0);
+		expect(lines[sourceAt + 1]).toBe(`  ${" ".repeat(10)}^`);
+	});
+
+	test("bash parameter expansion in backticks gets the escape hint", () => {
+		const message = compileError('await $`echo "v=${VAR:+yes}"`');
+		expect(message).toContain("interpolation");
+		expect(message).toContain("\\${");
+	});
+
+	test("the position survives in a multi-line cell", () => {
+		const message = compileError("const a = 1;\nconst b = 2;\nawait $`x ${VAR:+y}`");
+		expect(message).toContain("line 3");
+		expect(message).toContain("await $`x ${VAR:+y}`");
+	});
+
+	test("a genuine syntax error does not get the bash hint", () => {
+		expect(compileError("const x = ;")).not.toContain("interpolation");
+	});
+
+	test("valid JS interpolation compiles untouched", () => {
+		const { body } = transformCell("`${1 + 1}`");
+		expect(body).toContain("${1 + 1}");
+	});
+
+	test("already-escaped \\${ in backticks compiles untouched", () => {
+		expect(() => transformCell('await $`echo "\\${HOME}"`')).not.toThrow();
+	});
+});
+
 // ── npm specifiers ────────────────────────────────────────────────────────────
 // Parsing is the security boundary: the name reaches a generated package.json
 // and the resolver, so anything that is not a plain npm package name must be
