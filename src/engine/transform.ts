@@ -43,6 +43,52 @@ export interface TransformOptions {
 // exact thing we capture as the cell result.
 const transpiler = new Bun.Transpiler({ loader: "ts", deadCodeElimination: false });
 
+// Bun.Transpiler throws BuildMessage objects whose stringified form drops the
+// position — an agent sees only `Expected "}" but found ":"` and retries the
+// same cell verbatim. Rebuild every compile failure into a compiler-style
+// display (message, position, offending line, caret) so the error is
+// actionable, and append a one-line hint for known traps.
+interface BuildPosition {
+	line: number;
+	column: number;
+	lineText: string;
+}
+
+// Bash-style ${VAR:+x} written into a Bun.$`...` template literal is the one
+// known trap: Bun parses ${...} in backticks as JS interpolation, so shell
+// parameter expansion fails to compile with a message that never names the
+// escape. The check is deliberately loose (any ${ on the failing line) — a
+// wrong hint costs one sentence, a missing one costs a blind retry loop.
+function hintFor(lineText: string): string | undefined {
+	if (!lineText.includes("${")) return undefined;
+	return (
+		"Hint: Bun parses ${...} inside backticks as JavaScript interpolation. If this ${...} was meant as " +
+		"shell parameter expansion (e.g. ${VAR}, ${VAR:-default}), escape the dollar so the shell receives it " +
+		"literally: \\${VAR}."
+	);
+}
+
+function transpileCell(code: string): string {
+	try {
+		return transpiler.transformSync(code);
+	} catch (error) {
+		const position = (error as { position?: BuildPosition | null }).position;
+		if ((error as Error).name !== "BuildMessage" || !position?.lineText) throw error;
+		// BuildMessage is not `instanceof Error`, but it does carry `.message`;
+		// String(error) would prefix the class name into the display.
+		const message = String((error as { message?: string }).message ?? error);
+		const lines = [
+			`Cell did not compile: ${message} (line ${position.line}, column ${position.column})`,
+			"",
+			`  ${position.lineText}`,
+			`  ${" ".repeat(Math.max(0, position.column - 1))}^`,
+		];
+		const hint = hintFor(position.lineText);
+		if (hint) lines.push("", hint);
+		throw new SyntaxError(lines.join("\n"));
+	}
+}
+
 function collectPatternNames(pattern: Pattern, into: string[]): void {
 	switch (pattern.type) {
 		case "Identifier":
@@ -115,7 +161,7 @@ function variableReplacement(decl: VariableDeclaration, source: string): string 
 
 export function transformCell(code: string, options: TransformOptions = {}): TransformedCell {
 	const ctxName = options.ctxName ?? "__ctx";
-	const js = transpiler.transformSync(code);
+	const js = transpileCell(code);
 	const program: Program = parse(js, { ecmaVersion: "latest", sourceType: "module", allowAwaitOutsideFunction: true });
 
 	const declaredNames: string[] = [];
