@@ -176,8 +176,8 @@ interface ActiveExecution {
 
 // ── process-wide cleanup ─────────────────────────────────────────────────────
 // Guests are killed when the host exits normally. As a backstop the guest also
-// self-exits when its stdin reaches EOF, which covers a host death abrupt
-// enough that no handler runs.
+// self-exits when the protocol pipe reaches EOF, which covers a host death
+// abrupt enough that no handler runs.
 
 const liveEngines = new Set<EngineManager>();
 let cleanupHandlersInstalled = false;
@@ -218,6 +218,8 @@ export class EngineManager {
 	/** Held so the protocol reader is not garbage-collected mid-session, which
 	 * would close the guest's write end and kill it with EPIPE. */
 	private protocolReader?: ReturnType<typeof createInterface>;
+	/** The duplex fd-3 pipe; commands go out on it as well as replies coming in. */
+	private protocolChannel?: NodeJS.WritableStream;
 	/** Abort + source per cell, retained past settlement for late bridge calls. */
 	private readonly cellRecords = new Map<string, { hostAbort: AbortController; code: string }>();
 	/** Set when an aborted cell may still be wedging the guest's event loop. */
@@ -260,8 +262,13 @@ export class EngineManager {
 				...(this.options.env ?? {}),
 				[NONCE_ENV]: this.nonce,
 			},
-			// fd 3 carries protocol traffic so stdout/stderr stay pure user output.
-			stdio: ["pipe", "pipe", "pipe", "pipe"],
+			// fd 3 is a duplex socketpair carrying protocol traffic in both
+			// directions, so stdout/stderr stay pure user output — and stdin can be
+			// /dev/null. Commands must not travel over stdin: subprocesses spawned
+			// by cells inherit the guest's fd 0, and a command pipe there never
+			// closes, so anything reading stdin (`cat`, an interactive prompt)
+			// would hang forever waiting for EOF.
+			stdio: ["ignore", "pipe", "pipe", "pipe"],
 		});
 		this.child = child;
 		this.childClosed = new Promise((resolve) => child.once("close", () => resolve()));
@@ -281,10 +288,11 @@ export class EngineManager {
 			});
 		});
 
-		const protocolStream = child.stdio[PROTOCOL_FD] as NodeJS.ReadableStream | null;
+		const protocolStream = child.stdio[PROTOCOL_FD] as (NodeJS.ReadableStream & NodeJS.WritableStream) | null;
 		if (!protocolStream) {
 			throw new Error("Engine guest was spawned without a protocol pipe on fd 3");
 		}
+		this.protocolChannel = protocolStream;
 		this.protocolReader = createInterface({ input: protocolStream });
 		this.protocolReader.on("line", (line) => this.handleGuestLine(line));
 		// Anything the guest writes to the real stdout/stderr fds is subprocess
@@ -375,6 +383,7 @@ export class EngineManager {
 		this.failAllPending(new Error("Engine has been shut down"));
 		this.child?.kill("SIGKILL");
 		this.child = undefined;
+		this.protocolChannel = undefined;
 		this.protocolReader?.close();
 		this.protocolReader = undefined;
 	}
@@ -396,12 +405,12 @@ export class EngineManager {
 		// settles. dispatchHostRequest catches the throw and sends an error
 		// reply instead, which is always encodable.
 		const encoded = encodeMessage(message, this.nonce);
-		// A write into a dying child's stdin can throw synchronously. A dead pipe
+		// A write into a dying child's pipe can throw synchronously. A dead pipe
 		// here only ever means "engine gone", which every caller already learns
 		// through the exit path — a late host reply must not become an unhandled
 		// rejection inside dispatchHostRequest's own error handler.
 		try {
-			this.child?.stdin?.write(encoded);
+			this.protocolChannel?.write(encoded);
 		} catch {}
 	}
 
